@@ -2563,7 +2563,8 @@ class SkillClawAPIServer:
 
         if native_body is not None:
             # Forward the original native Anthropic body directly — avoids lossy OpenAI round-trip.
-            _strip = {"session_id", "turn_type", "session_done", "stream"}
+            _strip = {"session_id", "turn_type", "session_done", "stream",
+                      "context_management", "output_config"}
             send_body: dict = {k: v for k, v in native_body.items() if k not in _strip}
             send_body["model"] = model
         else:
