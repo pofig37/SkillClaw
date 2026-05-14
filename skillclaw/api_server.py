@@ -1565,6 +1565,10 @@ class SkillClawAPIServer:
             await owner._check_auth(authorization)
 
             body = await request.json()
+            _upstream_anthropic_headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower().startswith("anthropic-") or k.lower() == "user-agent"
+            }
             incoming_messages = body.get("messages", [])
             if isinstance(incoming_messages, list):
                 rewritten_messages, _ = _rewrite_new_session_bootstrap_prompt(incoming_messages)
@@ -1594,6 +1598,7 @@ class SkillClawAPIServer:
                 session_id=session_id,
                 turn_type=turn_type,
                 session_done=session_done,
+                upstream_headers=_upstream_anthropic_headers,
             )
             if stream:
                 return StreamingResponse(owner._stream_response(result), media_type="text/event-stream")
@@ -2211,6 +2216,7 @@ class SkillClawAPIServer:
         session_id: str,
         turn_type: str,
         session_done: bool,
+        upstream_headers: dict | None = None,
     ) -> dict[str, Any]:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -2310,7 +2316,7 @@ class SkillClawAPIServer:
             forward_body["model"] = self._served_model
         forward_body["messages"] = messages  # potentially skill-injected
 
-        output = await self._forward_to_llm(forward_body)
+        output = await self._forward_to_llm(forward_body, upstream_headers=upstream_headers)
         output["model"] = forward_body.get("model") or self._served_model
 
         choice = output.get("choices", [{}])[0]
@@ -2529,17 +2535,82 @@ class SkillClawAPIServer:
     # LLM forwarding                                                       #
     # ------------------------------------------------------------------ #
 
-    async def _forward_to_llm(self, body: dict[str, Any]) -> dict[str, Any]:
+    async def _forward_to_llm(self, body: dict[str, Any], upstream_headers: dict | None = None) -> dict[str, Any]:
         """Forward to a real LLM API.
 
         Supports providers:
           - ``"openai"`` (default) — any OpenAI-compatible ``/v1/chat/completions`` endpoint.
           - ``"openrouter"`` — OpenRouter gateway (OpenAI-compatible + routing extensions).
           - ``"bedrock"`` — AWS Bedrock Converse API via :class:`BedrockChatClient`.
+          - ``"anthropic"`` — Anthropic Messages API (``/v1/messages``).
         """
         if self.config.llm_provider == "bedrock":
             return await self._forward_to_llm_bedrock(body)
+        if self.config.llm_provider == "anthropic":
+            return await self._forward_to_llm_anthropic(body, upstream_headers=upstream_headers)
         return await self._forward_to_llm_openai(body)
+
+    async def _forward_to_llm_anthropic(self, body: dict, upstream_headers: dict | None = None) -> dict:
+        """Forward to Anthropic Messages API (/v1/messages), forwarding upstream headers."""
+        import httpx
+        import time as _time
+
+        api_base = self.config.llm_api_base.rstrip("/")
+        model = self.config.llm_model_id or body.get("model", "")
+        messages = body.get("messages", [])
+
+        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+        system = system_parts[0] if system_parts else ""
+        anthropic_msgs = [{"role": m["role"], "content": m["content"]}
+                          for m in messages if m.get("role") != "system"]
+
+        max_tokens = body.get("max_completion_tokens") or body.get("max_tokens") or 8192
+        send_body: dict = {"model": model, "max_tokens": max_tokens, "messages": anthropic_msgs}
+        if system:
+            send_body["system"] = system
+        if "temperature" in body:
+            send_body["temperature"] = body["temperature"]
+
+        api_key = self.config.llm_api_key or "placeholder"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        # Forward upstream anthropic-* / User-Agent headers from claude.exe transparently
+        if upstream_headers:
+            for k, v in upstream_headers.items():
+                kl = k.lower()
+                if kl not in ("anthropic-version", "authorization", "x-api-key", "content-type"):
+                    headers[k] = v
+
+        try:
+            async with httpx.AsyncClient(timeout=_llm_request_timeout_seconds()) as client:
+                resp = await client.post(f"{api_base}/messages", json=send_body, headers=headers)
+                resp.raise_for_status()
+                r = resp.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM error {e.response.status_code}: {e.response.text}",
+            )
+
+        stop_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
+        finish = stop_map.get(r.get("stop_reason", ""), "stop")
+        content_blocks = r.get("content", [])
+        text = next((b.get("text", "") for b in content_blocks if b.get("type") == "text"), "")
+        usage = r.get("usage", {})
+        return {
+            "id": f"chatcmpl-{int(_time.time())}",
+            "object": "chat.completion",
+            "model": r.get("model", model),
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": text},
+                         "finish_reason": finish}],
+            "usage": {"prompt_tokens": usage.get("input_tokens", 0),
+                      "completion_tokens": usage.get("output_tokens", 0),
+                      "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
+        }
 
     def _responses_native_enabled(self) -> bool:
         """Return whether /v1/responses should be forwarded as Responses API."""
