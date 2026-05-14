@@ -2592,12 +2592,15 @@ class SkillClawAPIServer:
                 if kl not in ("anthropic-version", "authorization", "x-api-key", "content-type"):
                     headers[k] = v
 
+        logger.info("[Anthropic] → %s/messages model=%s native=%s body_keys=%s",
+                    api_base, model, native_body is not None, list(send_body.keys()))
         try:
             async with httpx.AsyncClient(timeout=_llm_request_timeout_seconds()) as client:
                 resp = await client.post(f"{api_base}/messages", json=send_body, headers=headers)
                 resp.raise_for_status()
                 r = resp.json()
         except httpx.HTTPStatusError as e:
+            logger.error("[Anthropic] %d error: %s", e.response.status_code, e.response.text[:500])
             raise HTTPException(
                 status_code=502,
                 detail=f"Upstream LLM error {e.response.status_code}: {e.response.text}",
