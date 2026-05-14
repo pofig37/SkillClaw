@@ -1773,6 +1773,7 @@ class SkillClawAPIServer:
                 session_id=session_id,
                 turn_type=turn_type,
                 session_done=session_done,
+                native_body=raw_body,
             )
             if stream:
                 return StreamingResponse(
@@ -2217,6 +2218,7 @@ class SkillClawAPIServer:
         turn_type: str,
         session_done: bool,
         upstream_headers: dict | None = None,
+        native_body: dict | None = None,
     ) -> dict[str, Any]:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -2310,13 +2312,14 @@ class SkillClawAPIServer:
         forward_body = {k: v for k, v in body.items() if k not in _NON_STANDARD_BODY_KEYS}
         forward_body["stream"] = False
         forward_body.pop("stream_options", None)
-        forward_body["logprobs"] = True
-        forward_body["top_logprobs"] = 1
+        if native_body is None:
+            forward_body["logprobs"] = True
+            forward_body["top_logprobs"] = 1
         if "model" not in forward_body:
             forward_body["model"] = self._served_model
         forward_body["messages"] = messages  # potentially skill-injected
 
-        output = await self._forward_to_llm(forward_body, upstream_headers=upstream_headers)
+        output = await self._forward_to_llm(forward_body, upstream_headers=upstream_headers, native_body=native_body)
         output["model"] = forward_body.get("model") or self._served_model
 
         choice = output.get("choices", [{}])[0]
@@ -2535,7 +2538,7 @@ class SkillClawAPIServer:
     # LLM forwarding                                                       #
     # ------------------------------------------------------------------ #
 
-    async def _forward_to_llm(self, body: dict[str, Any], upstream_headers: dict | None = None) -> dict[str, Any]:
+    async def _forward_to_llm(self, body: dict[str, Any], upstream_headers: dict | None = None, native_body: dict | None = None) -> dict[str, Any]:
         """Forward to a real LLM API.
 
         Supports providers:
@@ -2547,29 +2550,34 @@ class SkillClawAPIServer:
         if self.config.llm_provider == "bedrock":
             return await self._forward_to_llm_bedrock(body)
         if self.config.llm_provider == "anthropic":
-            return await self._forward_to_llm_anthropic(body, upstream_headers=upstream_headers)
+            return await self._forward_to_llm_anthropic(body, upstream_headers=upstream_headers, native_body=native_body)
         return await self._forward_to_llm_openai(body)
 
-    async def _forward_to_llm_anthropic(self, body: dict, upstream_headers: dict | None = None) -> dict:
+    async def _forward_to_llm_anthropic(self, body: dict, upstream_headers: dict | None = None, native_body: dict | None = None) -> dict:
         """Forward to Anthropic Messages API (/v1/messages), forwarding upstream headers."""
         import httpx
         import time as _time
 
         api_base = self.config.llm_api_base.rstrip("/")
-        model = self.config.llm_model_id or body.get("model", "")
-        messages = body.get("messages", [])
+        model = self.config.llm_model_id or (native_body or body).get("model", "")
 
-        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-        system = system_parts[0] if system_parts else ""
-        anthropic_msgs = [{"role": m["role"], "content": m["content"]}
-                          for m in messages if m.get("role") != "system"]
-
-        max_tokens = body.get("max_completion_tokens") or body.get("max_tokens") or 8192
-        send_body: dict = {"model": model, "max_tokens": max_tokens, "messages": anthropic_msgs}
-        if system:
-            send_body["system"] = system
-        if "temperature" in body:
-            send_body["temperature"] = body["temperature"]
+        if native_body is not None:
+            # Forward the original native Anthropic body directly — avoids lossy OpenAI round-trip.
+            _strip = {"session_id", "turn_type", "session_done", "stream"}
+            send_body: dict = {k: v for k, v in native_body.items() if k not in _strip}
+            send_body["model"] = model
+        else:
+            messages = body.get("messages", [])
+            system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+            system = system_parts[0] if system_parts else ""
+            anthropic_msgs = [{"role": m["role"], "content": m["content"]}
+                              for m in messages if m.get("role") != "system"]
+            max_tokens = body.get("max_completion_tokens") or body.get("max_tokens") or 8192
+            send_body = {"model": model, "max_tokens": max_tokens, "messages": anthropic_msgs}
+            if system:
+                send_body["system"] = system
+            if "temperature" in body:
+                send_body["temperature"] = body["temperature"]
 
         api_key = self.config.llm_api_key or "placeholder"
         headers = {
