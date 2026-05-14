@@ -1780,6 +1780,10 @@ class SkillClawAPIServer:
                     owner._stream_anthropic_response(result, model, tool_names),
                     media_type="text/event-stream",
                 )
+            # Return the raw Anthropic response directly — avoids lossy tool_use stripping.
+            native_resp = result.get("response", {}).get("native_anthropic_response")
+            if native_resp is not None:
+                return JSONResponse(content=native_resp)
             return JSONResponse(content=_openai_to_anthropic_response(result["response"], model, tool_names))
 
         return app
@@ -2612,17 +2616,26 @@ class SkillClawAPIServer:
         content_blocks = r.get("content", [])
         text = next((b.get("text", "") for b in content_blocks if b.get("type") == "text"), "")
         usage = r.get("usage", {})
-        return {
+        tool_calls = [
+            {"id": b.get("id", ""), "type": "function",
+             "function": {"name": b.get("name", ""), "arguments": json.dumps(b.get("input", {}))}}
+            for b in content_blocks if b.get("type") == "tool_use"
+        ]
+        message: dict = {"role": "assistant", "content": text}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        result = {
             "id": f"chatcmpl-{int(_time.time())}",
             "object": "chat.completion",
             "model": r.get("model", model),
-            "choices": [{"index": 0,
-                         "message": {"role": "assistant", "content": text},
-                         "finish_reason": finish}],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
             "usage": {"prompt_tokens": usage.get("input_tokens", 0),
                       "completion_tokens": usage.get("output_tokens", 0),
                       "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)},
         }
+        if native_body is not None:
+            result["native_anthropic_response"] = r
+        return result
 
     def _responses_native_enabled(self) -> bool:
         """Return whether /v1/responses should be forwarded as Responses API."""
